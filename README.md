@@ -2,6 +2,8 @@
   <h1>C Y B E R I A</h1>
 </div>
 
+<img width="665" height="692" alt="image" src="https://github.com/user-attachments/assets/42ff17a1-d90c-4e7d-9480-bb1a1d92c2e3" />
+
 An opinionated [Matrix](https://matrix.org/) TUI, dressed in nightshadeNeon.
 The UI is kept as simple as possible and there's no mouse support (yet, at
 least). With the assumption that usually only the last couple messages
