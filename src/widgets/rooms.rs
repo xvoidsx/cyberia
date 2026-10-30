@@ -505,6 +505,65 @@ mod tests {
         assert_eq!(before, after);
     }
 
+    /// Wide katakana rain glyphs render over their own cell AND the cell
+    /// to the right. The guard must therefore keep the right neighbour
+    /// free of TEXT, or a glyph landing in an empty cell left of a
+    /// letter visually eats that letter on a real terminal — while the
+    /// buffer still holds the letter, so the terminal diff never
+    /// rewrites it and the hole persists. TestBackend cannot show that
+    /// (its cells still hold the text), so assert the guard invariant
+    /// directly: no rain glyph sits immediately left of a text cell.
+    /// Checked on EVERY frame, not just the last: rain moves, so a
+    /// violation in one frame is gone by the next and a final-frame
+    /// check would vacuously pass. A neighbour holding another rain
+    /// glyph is allowed: respawned columns can sit adjacent, and
+    /// rain-on-rain overlap eats no text (in this fixture the only
+    /// katakana in the buffer is rain — title, tagline, borders and
+    /// search are all ASCII).
+    #[test]
+    fn picker_rain_never_lands_left_of_text() {
+        let rooms = Rooms::new(Matrix::default(), None);
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut rain_seen = 0;
+        for _ in 0..200 {
+            term.draw(|f| f.render_widget(rooms.widget(), f.area()))
+                .unwrap();
+            let buf = term.backend().buffer();
+            let (w, h) = (buf.area.width, buf.area.height);
+            for y in 0..h {
+                for x in 0..w {
+                    let cell = &buf[(x, y)];
+                    let sym = cell.symbol();
+                    let mut chars = sym.chars();
+                    let is_kana = chars.next().is_some_and(|c| {
+                        ('\u{30A0}'..='\u{30FF}').contains(&c) && chars.next().is_none()
+                    });
+                    if !is_kana {
+                        continue;
+                    }
+                    rain_seen += 1;
+                    assert!(x + 1 < w, "rain glyph at last column x={x}, y={y}");
+                    let n = &buf[(x + 1, y)];
+                    let n_sym = n.symbol();
+                    let mut n_chars = n_sym.chars();
+                    let n_is_kana = n_chars.next().is_some_and(|c| {
+                        ('\u{30A0}'..='\u{30FF}').contains(&c) && n_chars.next().is_none()
+                    });
+                    let n_empty = n_sym == " "
+                        && n.fg == Color::Reset
+                        && n.bg == Color::Reset
+                        && n.modifier.is_empty();
+                    assert!(
+                        n_empty || n_is_kana,
+                        "rain glyph at ({x}, {y}) has text right neighbour {n_sym:?}",
+                    );
+                }
+            }
+        }
+        assert!(rain_seen > 0, "no rain drawn at all; test is vacuous");
+    }
+
     fn ts_now_minus(secs: i64) -> MilliSecondsSinceUnixEpoch {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
