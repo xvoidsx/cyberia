@@ -87,7 +87,9 @@ impl Rooms {
     /// only meaningful in that order, because once the text is down,
     /// a cell that is still exactly default-empty is genuinely empty —
     /// so rain falls through the whole picker, visible in every empty
-    /// space, and never lands on text. Drawing it first with a block
+    /// space, and never lands on text. The guard also requires the
+    /// right neighbour to be empty, because katakana glyphs are wide
+    /// and render over the next cell too. Drawing it first with a block
     /// exclusion (as 1.1.7 did) confined visible rain to the 1-row
     /// margins, which is why it looked stuck at the top.
     fn tick_rain(&self, area: Rect, buf: &mut Buffer) {
@@ -128,17 +130,35 @@ impl Rooms {
                     Color::Rgb(r, g, b) => Color::Rgb(r / 4, g / 4, b / 4),
                     c => c,
                 };
-                let cell = &mut buf[(col.x, y)];
-                // only into cells the content left exactly alone: a
+                // Only into cells the content left exactly alone: a
                 // space with default colors and no modifier. Text cells
                 // carry a color, the highlight marker carries a color,
-                // borders carry a glyph — all of them fail this, so rain
-                // can never land on a text element, only in empty space.
-                if cell.symbol() == " "
-                    && cell.fg == Color::Reset
-                    && cell.bg == Color::Reset
-                    && cell.modifier.is_empty()
-                {
+                // borders carry a glyph — all of them fail this.
+                //
+                // And the cell to the RIGHT must be empty too: a
+                // katakana glyph is WIDE, rendering over its own cell
+                // and the next one. The old guard checked only the
+                // target cell, so a glyph landing in an empty cell left
+                // of a letter swallowed that letter on the real
+                // terminal — while the buffer still held the letter, so
+                // the terminal diff never rewrote it and the hole
+                // persisted. A wide glyph never reaches left, so the
+                // right neighbour is the only one that matters; glyphs
+                // at the last column are skipped outright.
+                let target = &buf[(col.x, y)];
+                let target_empty = target.symbol() == " "
+                    && target.fg == Color::Reset
+                    && target.bg == Color::Reset
+                    && target.modifier.is_empty();
+                let neighbour_empty = col.x + 1 < area.width && {
+                    let n = &buf[(col.x + 1, y)];
+                    n.symbol() == " "
+                        && n.fg == Color::Reset
+                        && n.bg == Color::Reset
+                        && n.modifier.is_empty()
+                };
+                if target_empty && neighbour_empty {
+                    let cell = &mut buf[(col.x, y)];
                     cell.set_char(*g);
                     cell.set_style(Style::default().fg(color));
                 }
