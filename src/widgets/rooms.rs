@@ -82,11 +82,15 @@ impl Rooms {
         ret
     }
 
-    /// Advance the hub rain. Called from render (the popup renders every tick).
-    /// Rain is kept out of `exclude` (the content block): katakana packed
-    /// between list rows reads as text interference, not atmosphere, so
-    /// the rain lives in the margins and the list stays clean.
-    fn tick_rain(&self, area: Rect, buf: &mut Buffer, exclude: Rect) {
+    /// Advance the hub rain. Called from render, AFTER the content is
+    /// drawn (see RoomsWidget::render): the don't-stomp guard below is
+    /// only meaningful in that order, because once the text is down,
+    /// a cell that is still exactly default-empty is genuinely empty —
+    /// so rain falls through the whole picker, visible in every empty
+    /// space, and never lands on text. Drawing it first with a block
+    /// exclusion (as 1.1.7 did) confined visible rain to the 1-row
+    /// margins, which is why it looked stuck at the top.
+    fn tick_rain(&self, area: Rect, buf: &mut Buffer) {
         let mut rain = self.rain.borrow_mut();
 
         // (re)init on resize
@@ -118,14 +122,6 @@ impl Rooms {
                     continue;
                 }
                 let y = y as u16;
-                // keep rain out of the content block (see the doc comment)
-                if col.x >= exclude.x
-                    && col.x < exclude.x.saturating_add(exclude.width)
-                    && y >= exclude.y
-                    && y < exclude.y.saturating_add(exclude.height)
-                {
-                    continue;
-                }
                 let t = i as f32 / col.len.max(1) as f32;
                 // push the ramp darker: hub rain is atmosphere, not theater
                 let color = match rain_color(t) {
@@ -133,8 +129,16 @@ impl Rooms {
                     c => c,
                 };
                 let cell = &mut buf[(col.x, y)];
-                // don't stomp cells the content already claimed
-                if cell.symbol() == " " {
+                // only into cells the content left exactly alone: a
+                // space with default colors and no modifier. Text cells
+                // carry a color, the highlight marker carries a color,
+                // borders carry a glyph — all of them fail this, so rain
+                // can never land on a text element, only in empty space.
+                if cell.symbol() == " "
+                    && cell.fg == Color::Reset
+                    && cell.bg == Color::Reset
+                    && cell.modifier.is_empty()
+                {
                     cell.set_char(*g);
                     cell.set_style(Style::default().fg(color));
                 }
@@ -310,20 +314,15 @@ impl Widget for RoomsWidget<'_> {
         // old rain glyphs accumulate into dark smudges over the text
         buf.merge(&Buffer::empty(area));
 
-        // The content block, computed before the rain so the rain can be
-        // kept out of it (see tick_rain). The popup is fullscreen, so
-        // these area-relative coordinates are absolute buffer coordinates
-        // and the exclusion lines up with what is drawn below.
+        // The popup is fullscreen, so these area-relative coordinates are
+        // absolute buffer coordinates.
+        let full = area;
         let block_area = Layout::default()
             .direction(Direction::Horizontal)
             .vertical_margin(1)
             .horizontal_margin(get_margin(area.width, 70))
             .constraints([Constraint::Percentage(100)].as_ref())
             .split(area)[0];
-
-        // rain first, but only outside the content block: atmosphere in
-        // the margins, a clean list inside.
-        self.rooms.tick_rain(area, buf, block_area);
 
         let area = block_area;
 
@@ -374,7 +373,13 @@ impl Widget for RoomsWidget<'_> {
         let mut list_state = self.rooms.list_state.take();
         let list = List::new(items).highlight_style(role::highlight_symbol()).highlight_symbol("> ");
         StatefulWidget::render(list, area, buf, &mut list_state);
-        self.rooms.list_state.set(list_state)
+        self.rooms.list_state.set(list_state);
+
+        // rain last, into empty cells only (see tick_rain): the content
+        // is already down, so rain falls through the whole picker and
+        // never touches text — and it touches no list state at all, so
+        // the picker itself stays static while the rain moves.
+        self.rooms.tick_rain(full, buf);
     }
 }
 
@@ -451,6 +456,34 @@ pub fn sort_rooms(rooms: &mut [DecoratedRoom]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Rendering the picker must never move selection or scroll offset:
+    /// rain is decoration only and the picker stays static.
+    #[test]
+    fn picker_render_keeps_list_state_static() {
+        let rooms = Rooms::new(Matrix::default(), None);
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let snapshot = |rooms: &Rooms| {
+            let s = rooms.list_state.take();
+            let v = (s.selected(), s.offset());
+            rooms.list_state.set(s);
+            v
+        };
+        // render twice first: the first render may normalize state for
+        // an empty list, but after that it must be stable
+        for _ in 0..2 {
+            term.draw(|f| f.render_widget(rooms.widget(), f.area()))
+                .unwrap();
+        }
+        let before = snapshot(&rooms);
+        term.draw(|f| f.render_widget(rooms.widget(), f.area()))
+            .unwrap();
+        let after = snapshot(&rooms);
+        assert_eq!(before, after);
+    }
 
     fn ts_now_minus(secs: i64) -> MilliSecondsSinceUnixEpoch {
         let now_ms = SystemTime::now()
