@@ -54,6 +54,9 @@ pub enum MatuiEvent {
     Search(String),
     SyncComplete,
     SyncStarted(SyncType),
+    /// A manual reconnect (Ctrl+R) succeeded. Like SyncComplete, but it
+    /// keeps the room the user is already looking at.
+    ReconnectComplete,
     Timeline(AnyTimelineEvent),
     TimelineBatch(Batch),
     Typing(Room, Vec<OwnedUserId>),
@@ -72,6 +75,18 @@ pub struct Batch {
     pub room: Room,
     pub events: Vec<AnyTimelineEvent>,
     pub cursor: Option<String>,
+}
+
+/// Drop everything tied to the old session: no valid session means no
+/// valid chat, thread, verification, invites, or receipts. Used when the
+/// app lands back on sign-in (dead session, logout).
+fn reset_for_signin(app: &mut App) {
+    app.chat = None;
+    app.thread = None;
+    app.sas = None;
+    app.invites.clear();
+    app.invites_seen.clear();
+    app.receipts.clear();
 }
 
 pub fn handle_app_event(event: MatuiEvent, app: &mut App) {
@@ -93,6 +108,10 @@ pub fn handle_app_event(event: MatuiEvent, app: &mut App) {
             app.running = false;
         }
         MatuiEvent::LoginRequired => {
+            // No valid session means no valid chat, thread, verification,
+            // invites, or receipts: drop them so nothing from the old
+            // session lingers behind the sign-in form.
+            reset_for_signin(app);
             app.set_popup(Popup::Homeserver(Homeserver::default()));
         }
         MatuiEvent::PasswordLoginRequired(homeserver) => {
@@ -208,6 +227,25 @@ pub fn handle_app_event(event: MatuiEvent, app: &mut App) {
 
             if let Some(room) = rooms.first() {
                 app.select_room(room.inner.clone())
+            }
+        }
+        MatuiEvent::ReconnectComplete => {
+            app.popup = None;
+
+            // now we can sync forever (a no-op if the old loop is still
+            // running)
+            app.matrix.sync();
+
+            // a reconnect from the failed state has no room showing yet:
+            // land on the first room, like a fresh startup. A mid-session
+            // reconnect keeps the room the user is already looking at.
+            if app.chat.is_none() {
+                let mut rooms = app.matrix.fetch_rooms();
+                sort_rooms(&mut rooms);
+
+                if let Some(room) = rooms.first() {
+                    app.select_room(room.inner.clone())
+                }
             }
         }
         MatuiEvent::Timeline(event) => {
@@ -336,6 +374,13 @@ pub fn handle_key_event(
         }
         KeyCode::Char('?') => {
             app.set_popup(Popup::Help(Help::default()));
+            return Ok(());
+        }
+        // The modifiers matter here: the match is on the code alone, so
+        // an unguarded 'r' would steal every typed 'r' from chat input.
+        // Chat uses Ctrl+d and Ctrl+u, never Ctrl+r, so this key is free.
+        KeyCode::Char('r') if key_event.modifiers == KeyModifiers::CONTROL => {
+            app.matrix.reconnect();
             return Ok(());
         }
         _ => {}

@@ -7,6 +7,8 @@ use std::{fs, thread};
 use std::future::IntoFuture;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, TryRecvError, channel};
 use std::time::Duration;
 
@@ -48,7 +50,6 @@ use matrix_sdk::ruma::exports::serde_json;
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::utils::local_server::{LocalServerBuilder, LocalServerResponse};
 use matrix_sdk::{Client, LoopCtrl, ServerName, SessionChange};
-use once_cell::sync::OnceCell;
 use rand::rng;
 use rand::{RngExt, distr::Alphanumeric};
 
@@ -84,9 +85,22 @@ use super::notify::Notify;
 /// A Matrix client that maintains it's own Tokio runtime
 #[derive(Clone)]
 pub struct Matrix {
-    client: Arc<OnceCell<Client>>,
+    /// The current client, if one is set. A plain slot (not a OnceCell):
+    /// signing out and back in replaces the client in the same process,
+    /// and a naive re-`init()` on a OnceCell would panic.
+    client: Arc<Mutex<Option<Client>>>,
     room_cache: Arc<RoomCache>,
     notify: Arc<Notify>,
+    /// Bumped whenever the session ends (logout, dead token). Background
+    /// tasks from the old session (sync loop, session watcher) check this
+    /// and stop instead of acting on a client that is no longer current.
+    generation: Arc<AtomicU64>,
+    /// True while a startup sync (init, fresh login, manual reconnect) is
+    /// running, so a second one cannot start on top of it.
+    startup_sync_in_flight: Arc<AtomicBool>,
+    /// True while the forever sync loop is running, so a reconnect cannot
+    /// start a second loop on top of it.
+    sync_loop_running: Arc<AtomicBool>,
 }
 
 /// What should we do with the file after we download it?
@@ -105,10 +119,23 @@ pub enum Moderation {
 impl Default for Matrix {
     fn default() -> Self {
         Matrix {
-            client: Arc::new(OnceCell::default()),
+            client: Arc::new(Mutex::new(None)),
             room_cache: Arc::new(RoomCache::default()),
             notify: Arc::new(Notify::default()),
+            generation: Arc::new(AtomicU64::new(0)),
+            startup_sync_in_flight: Arc::new(AtomicBool::new(false)),
+            sync_loop_running: Arc::new(AtomicBool::new(false)),
         }
+    }
+}
+
+/// Clears a Matrix in-flight flag when the task holding it ends, on every
+/// path (including early returns).
+struct FlagGuard(Arc<AtomicBool>);
+
+impl Drop for FlagGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -128,11 +155,30 @@ impl Matrix {
         (data_dir, session_file)
     }
 
+    pub(crate) fn client_opt(&self) -> Option<Client> {
+        self.client.lock().expect("to lock client").clone()
+    }
+
     pub(crate) fn client(&self) -> Client {
-        self.client
-            .get()
-            .expect("client expected but not set")
-            .to_owned()
+        self.client_opt().expect("client expected but not set")
+    }
+
+    fn set_client(&self, client: Client) {
+        *self.client.lock().expect("to lock client") = Some(client);
+    }
+
+    fn clear_client(&self) {
+        *self.client.lock().expect("to lock client") = None;
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// End the current session's background work: the sync loop and the
+    /// session watcher check this and stop on their next step.
+    fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Raw bytes for a media URI, for inline rendering. Uses the SDK cache.
@@ -155,6 +201,26 @@ impl Matrix {
     pub fn init(&self) {
         info!("initializing matrix");
 
+        let matrix = self.clone();
+
+        // Only one startup sync at a time: a second init (or a reconnect
+        // pressed while init is still running) is a no-op.
+        if matrix
+            .startup_sync_in_flight
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+
+        App::spawn(async move {
+            let _guard = FlagGuard(matrix.startup_sync_in_flight.clone());
+            matrix.init_inner().await;
+        });
+    }
+
+    /// The body of init(), minus the in-flight guard: safe to call from the
+    /// manual reconnect path too, when no client is set yet.
+    async fn init_inner(&self) {
         let (_, session_file) = Matrix::dirs();
 
         if !session_file.exists() {
@@ -162,38 +228,62 @@ impl Matrix {
             return;
         }
 
-        let matrix = self.clone();
+        App::send(MatuiEvent::SyncStarted(SyncType::Latest));
 
-        App::spawn(async move {
-            App::send(MatuiEvent::SyncStarted(SyncType::Latest));
-
-            let (client, token) = match restore_session(session_file.as_path()).await {
-                Ok(tuple) => tuple,
-                Err(err) => {
-                    App::send(Error(err.to_string()));
-                    return;
-                }
-            };
-
-            info!("session restored");
-
-            matrix
-                .client
-                .set(client.clone())
-                .expect("could not set client");
-
-            matrix.watch_session(client.clone());
-
-            info!("syncing with token {:?}", token);
-
-            if let Err(err) = sync_once(client.clone(), token, &session_file).await {
+        let (client, token) = match restore_session(session_file.as_path()).await {
+            Ok(tuple) => tuple,
+            Err(err) => {
                 App::send(Error(err.to_string()));
                 return;
-            };
+            }
+        };
 
-            matrix.room_cache.populate(client).await;
+        info!("session restored");
+
+        self.set_client(client.clone());
+
+        self.watch_session(client.clone());
+
+        info!("syncing with stored token: {}", token.is_some());
+
+        if startup_sync(&client, token, &session_file).await {
+            self.room_cache.populate(client).await;
 
             App::send(MatuiEvent::SyncComplete);
+        }
+    }
+
+    /// Retry the connection on demand (Ctrl+R): re-run the startup sync on
+    /// the existing client, or the whole init when no client is set yet
+    /// (e.g. session restore failed). A no-op while a startup sync is
+    /// already running.
+    pub fn reconnect(&self) {
+        let matrix = self.clone();
+
+        if matrix
+            .startup_sync_in_flight
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+
+        App::spawn(async move {
+            let _guard = FlagGuard(matrix.startup_sync_in_flight.clone());
+
+            match matrix.client_opt() {
+                Some(client) => {
+                    let (_, session_file) = Matrix::dirs();
+                    let token = read_sync_token(&session_file);
+
+                    if startup_sync(&client, token, &session_file).await {
+                        matrix.room_cache.populate(client.clone()).await;
+                        App::send(MatuiEvent::ReconnectComplete);
+                    }
+                }
+                // No client yet (restore failed): full init is safe here,
+                // the slot it would fill is still empty.
+                None => matrix.init_inner().await,
+            }
         });
     }
 
@@ -302,19 +392,16 @@ impl Matrix {
 
     /// Everything that happens after a fresh login, no matter the flow.
     async fn finish_signin(&self, client: Client, session_file: PathBuf) {
-        self.client
-            .set(client.clone())
-            .expect("could not set client");
+        self.set_client(client.clone());
 
         self.watch_session(client.clone());
 
         App::send(MatuiEvent::LoginComplete);
         App::send(MatuiEvent::SyncStarted(SyncType::Initial));
 
-        if let Err(err) = sync_once(client.clone(), None, &session_file).await {
-            App::send(Error(err.to_string()));
+        if !startup_sync(&client, None, &session_file).await {
             return;
-        };
+        }
 
         self.room_cache.populate(client.clone()).await;
         App::send(MatuiEvent::SyncComplete);
@@ -325,10 +412,19 @@ impl Matrix {
     /// Keep the session file up to date as tokens refresh (OAuth access
     /// tokens are short-lived).
     fn watch_session(&self, client: Client) {
+        let matrix = self.clone();
+        let generation = self.generation();
+
         App::spawn(async move {
             let mut changes = client.subscribe_to_session_changes();
 
             while let Ok(change) = changes.recv().await {
+                // The session ended (logout, dead token) while this watcher
+                // was running: stop, the new session has its own watcher.
+                if matrix.generation() != generation {
+                    break;
+                }
+
                 match change {
                     SessionChange::TokensRefreshed => {
                         let (_, session_file) = Matrix::dirs();
@@ -337,11 +433,20 @@ impl Matrix {
                             error!("could not persist refreshed tokens: {}", err);
                         }
                     }
-                    // future improvement: wipe local data and return to
-                    // the signin form
-                    SessionChange::UnknownToken(_) => App::send(Error(
-                        "Your session has expired. Please sign in again.".to_string(),
-                    )),
+                    // The server no longer knows this token: the session is
+                    // dead. Set it aside and route to sign-in, never a
+                    // blank window with a dead client behind it.
+                    SessionChange::UnknownToken(_) => {
+                        info!("session expired (unknown token)");
+
+                        matrix.bump_generation();
+                        matrix.clear_client();
+                        matrix.room_cache.clear();
+
+                        let (_, session_file) = Matrix::dirs();
+                        recover_dead_session(&session_file);
+                        break;
+                    }
                 }
             }
         });
@@ -404,6 +509,13 @@ impl Matrix {
     }
 
     pub fn sync(&self) {
+        // Never run two forever loops: a reconnect that lands while the
+        // old loop is still alive just refreshes the rooms, it must not
+        // double the timeline stream.
+        if self.sync_loop_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
         let client = self.client();
 
         add_default_handlers(client.clone());
@@ -412,14 +524,27 @@ impl Matrix {
         // apparently we only need the token for sync_once
         let sync_settings = build_sync_settings(None);
 
+        let generation_flag = self.generation.clone();
+        let generation = self.generation();
+        let loop_flag = self.sync_loop_running.clone();
+
         App::spawn(async move {
+            let _guard = FlagGuard(loop_flag);
+
             // prompt for any invites that arrived while we weren't running
             for room in client.invited_rooms() {
                 send_invite_event(room).await;
             }
 
             let result = client
-                .sync_with_result_callback(sync_settings, |sync_result| async move {
+                .sync_with_result_callback(sync_settings, |sync_result| async {
+                    // The session ended (logout, dead token) while this
+                    // loop was running: stop instead of polling the server
+                    // forever with a token it no longer knows.
+                    if generation_flag.load(Ordering::SeqCst) != generation {
+                        return Ok(LoopCtrl::Break);
+                    }
+
                     let response = match sync_result {
                         Ok(resp) => resp,
                         Err(err) => {
@@ -439,7 +564,12 @@ impl Matrix {
                 })
                 .await;
 
-            if let Err(err) = result {
+            // A loop superseded by logout or re-login stays silent: its
+            // error is expected, and a popup over the sign-in form would
+            // be a lie about the new session.
+            if let Err(err) = result
+                && generation_flag.load(Ordering::SeqCst) == generation
+            {
                 error!("sync loop ended: {}", err);
                 App::send(Error(format!("Sync failed: {}", err)));
             }
@@ -1525,27 +1655,152 @@ fn build_encryption_settings() -> EncryptionSettings {
     }
 }
 
+/// Why an initial sync failed, classified so the caller can recover
+/// instead of showing a dead-end popup.
+enum InitialSyncError {
+    /// The session is dead (unknown/expired token). The only recovery is
+    /// signing in again.
+    Auth(anyhow::Error),
+    /// Anything else, after every retry. The server may come back, so the
+    /// user can retry.
+    Transient(anyhow::Error),
+}
+
+impl std::fmt::Display for InitialSyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InitialSyncError::Auth(err) | InitialSyncError::Transient(err) => err.fmt(f),
+        }
+    }
+}
+
 async fn sync_once(
     client: Client,
     sync_token: Option<String>,
     session_file: &Path,
-) -> anyhow::Result<String> {
+) -> Result<String, InitialSyncError> {
     let sync_settings = build_sync_settings(sync_token);
+
+    let mut last_error: Option<matrix_sdk::Error> = None;
 
     for _ in 0..10 {
         match client.sync_once(sync_settings.clone()).await {
             Ok(response) => {
-                persist_sync_token(session_file, response.next_batch.clone())?;
+                persist_sync_token(session_file, response.next_batch.clone())
+                    .map_err(InitialSyncError::Transient)?;
                 return Ok(response.next_batch);
             }
             Err(error) => {
+                // A dead token will never come back: stop retrying at once
+                // and let the caller route to sign-in.
+                if matches!(
+                    error.client_api_error_kind(),
+                    Some(matrix_sdk::ruma::api::error::ErrorKind::UnknownToken(_))
+                ) {
+                    return Err(InitialSyncError::Auth(error.into()));
+                }
+
                 info!("An error occurred during initial sync: {error}");
                 info!("Trying again…");
+                last_error = Some(error);
             }
         }
     }
 
-    bail!("Sync timeout.")
+    Err(InitialSyncError::Transient(anyhow::anyhow!(
+        "Sync failed after 10 attempts: {}",
+        last_error.map(|e| e.to_string()).unwrap_or_else(|| "no sync attempt made".to_string())
+    )))
+}
+
+/// Run the initial sync with recovery, sending progress and recovery
+/// events as it goes. Returns true on success.
+///
+/// - Auth failure: the dead session file is renamed to `.bak` and the
+///   sign-in popup is shown, never a blank window.
+/// - Transient failure: retries with growing backoff (1s, doubling to a
+///   30s cap) behind a visible "Reconnecting…" state, until the server
+///   comes back or the session dies. Recovery is automatic; no restart
+///   is needed.
+async fn startup_sync(
+    client: &Client,
+    token: Option<String>,
+    session_file: &Path,
+) -> bool {
+    match sync_once(client.clone(), token, session_file).await {
+        Ok(_) => return true,
+        Err(InitialSyncError::Auth(err)) => {
+            info!("session is dead (unknown token): {err}");
+            recover_dead_session(session_file);
+            return false;
+        }
+        Err(InitialSyncError::Transient(err)) => {
+            info!("initial sync failed, will retry without the stored token: {err}");
+        }
+    }
+
+    // The stored sync token is the prime suspect for a persistent failure
+    // (a stale next_batch bricks every attempt): one full sync without it.
+    App::send(ProgressStarted("Reconnecting…".to_string(), 0));
+
+    match sync_once(client.clone(), None, session_file).await {
+        Ok(_) => return true,
+        Err(InitialSyncError::Auth(err)) => {
+            info!("session is dead (unknown token): {err}");
+            recover_dead_session(session_file);
+            return false;
+        }
+        Err(InitialSyncError::Transient(err)) => {
+            info!("full sync failed too, retrying with backoff: {err}");
+        }
+    }
+
+    // Keep retrying, visibly, until the server comes back or the session
+    // dies. Backoff grows so a dead server is not hammered.
+    let mut delay = Duration::from_secs(1);
+
+    loop {
+        tokio::time::sleep(delay).await;
+        delay = std::cmp::min(delay * 2, Duration::from_secs(30));
+
+        match sync_once(client.clone(), None, session_file).await {
+            Ok(_) => return true,
+            Err(InitialSyncError::Auth(err)) => {
+                info!("session died during reconnect (unknown token): {err}");
+                recover_dead_session(session_file);
+                return false;
+            }
+            Err(InitialSyncError::Transient(err)) => {
+                info!("still failing, backing off: {err}");
+            }
+        }
+    }
+}
+
+/// The session is dead: move the file aside (never delete, so the failure
+/// stays reversible and diagnosable) and route to the sign-in popup.
+fn recover_dead_session(session_file: &Path) {
+    let backup = session_file.with_extension("bak");
+
+    if let Err(err) = fs::rename(session_file, &backup) {
+        error!(
+            "could not set dead session aside ({}): {}",
+            session_file.display(),
+            err
+        );
+    } else {
+        info!("dead session moved aside to {}", backup.display());
+    }
+
+    App::send(MatuiEvent::LoginRequired);
+}
+
+/// The stored sync token, if the session file is still readable. A missing
+/// or unreadable token just means the next sync is a full one.
+fn read_sync_token(session_file: &Path) -> Option<String> {
+    let serialized = fs::read_to_string(session_file).ok()?;
+    let full_session: FullSession = serde_json::from_str(&serialized).ok()?;
+    full_session.sync_token
 }
 
 fn persist_sync_token(session_file: &Path, sync_token: String) -> anyhow::Result<()> {

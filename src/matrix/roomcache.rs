@@ -59,6 +59,13 @@ impl RoomCache {
         rooms.retain(|r| r.inner.room_id() != room.room_id());
     }
 
+    /// Drop every cached room: the session they belong to is gone, and a
+    /// stale list must not linger behind the sign-in form.
+    pub fn clear(&self) {
+        let mut rooms = self.rooms.lock().expect("to unlock rooms");
+        rooms.clear();
+    }
+
     pub fn get_rooms(&self) -> Vec<DecoratedRoom> {
         self.rooms.lock().expect("to unlock rooms").clone()
     }
