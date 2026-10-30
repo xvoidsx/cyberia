@@ -167,6 +167,13 @@ impl Matrix {
         self.client.lock().expect("to lock client").clone()
     }
 
+    /// True while a startup sync (init, fresh login, manual reconnect) is
+    /// running. Lets the UI keep a truthful state on screen when the last
+    /// popup closes mid-sync instead of going blank.
+    pub(crate) fn startup_sync_in_flight(&self) -> bool {
+        self.startup_sync_in_flight.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn client(&self) -> Client {
         self.client_opt().expect("client expected but not set")
     }

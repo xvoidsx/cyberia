@@ -133,6 +133,7 @@ pub fn handle_app_event(event: MatuiEvent, app: &mut App) {
             app.popup = None;
         }
         MatuiEvent::ProgressStarted(msg, delay) => {
+            app.last_progress = Some(msg.clone());
             app.set_popup(Popup::Progress(Progress::new(&msg, delay)))
         }
         MatuiEvent::ProgressComplete => app.popup = None,
@@ -214,11 +215,17 @@ pub fn handle_app_event(event: MatuiEvent, app: &mut App) {
         }
         MatuiEvent::SyncStarted(st) => {
             match st {
-                SyncType::Initial => app.set_popup(Popup::Progress(Progress::new(
-                    "Performing initial sync.",
-                    0,
-                ))),
-                SyncType::Latest => app.set_popup(Popup::Progress(Progress::new("Syncing", 0))),
+                SyncType::Initial => {
+                    app.last_progress = Some("Performing initial sync.".to_string());
+                    app.set_popup(Popup::Progress(Progress::new(
+                        "Performing initial sync.",
+                        0,
+                    )))
+                }
+                SyncType::Latest => {
+                    app.last_progress = Some("Syncing".to_string());
+                    app.set_popup(Popup::Progress(Progress::new("Syncing", 0)))
+                }
             };
         }
         MatuiEvent::SyncComplete => {

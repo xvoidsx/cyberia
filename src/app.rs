@@ -66,6 +66,11 @@ pub struct App {
     /// Animated startup splash; a pure render overlay, gone after ~2s
     /// or on any keypress.
     pub splash: Option<Splash>,
+
+    /// The last progress message shown (initial sync, reconnecting, ...).
+    /// Lets close_popup restore a truthful state instead of a blank
+    /// screen when the last popup closes mid-sync.
+    pub last_progress: Option<String>,
 }
 
 impl App {
@@ -88,6 +93,7 @@ impl App {
             invites: VecDeque::new(),
             invites_seen: HashSet::new(),
             splash: Some(Splash::new()),
+            last_progress: None,
         }
     }
 
@@ -145,6 +151,22 @@ impl App {
 
     pub fn close_popup(&mut self) {
         self.popup = None;
+        // Never leave an empty frame while a startup sync is still in
+        // flight: with no chat or thread on screen, closing the last
+        // popup (Help, Rooms, ...) would otherwise blank the screen
+        // until the sync resolves — the ?-during-Reconnecting blank.
+        // Restoring the last progress state keeps something truthful on
+        // screen; the sync's own events overwrite it when they land.
+        if self.chat.is_none()
+            && self.thread.is_none()
+            && self.matrix.startup_sync_in_flight()
+        {
+            let msg = self
+                .last_progress
+                .clone()
+                .unwrap_or_else(|| "Reconnecting…".to_string());
+            self.popup = Some(Popup::Progress(Progress::new(&msg, 0)));
+        }
     }
 
     /// Handles the tick event of the terminal. Returns true if this tick
