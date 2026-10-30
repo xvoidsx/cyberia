@@ -94,6 +94,7 @@ impl Widget for HelpWidget {
 fn key_rows() -> Vec<Row<'static>> {
     vec![
         Row::new(vec!["Space", "Show the room switcher"]),
+        Row::new(vec!["Ctrl+r", "Retry the connection (reconnect)."]),
         Row::new(vec!["j*", "Select one line down."]),
         Row::new(vec!["k*", "Select one line up."]),
         Row::new(vec!["Ctrl+d", "Select half a page down."]),
@@ -196,7 +197,7 @@ fn command_rows() -> Vec<Row<'static>> {
         ]),
         Row::new(vec![":unignore", "Stop ignoring a user."]),
         Row::new(vec![":q", "Quit Cyberia."]),
-        Row::new(vec![":logout", "Log out, remove this session, and quit."]),
+        Row::new(vec![":logout", "Log out, remove this session, and return to sign-in."]),
         Row::new(vec!["?", "Back to key bindings."]),
     ]
 }

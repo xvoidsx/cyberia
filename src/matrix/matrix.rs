@@ -1013,14 +1013,19 @@ impl Matrix {
     }
 
     /// Log out on the server (invalidating this device, like Element's
-    /// "remove session") and wipe all local state, then quit.
+    /// "remove session") and wipe all local state, then return to the
+    /// sign-in form instead of quitting.
     pub fn logout(&self) {
-        let client = self.client();
+        let matrix = self.clone();
 
         App::spawn(async move {
             App::send(ProgressStarted("Logging out.".to_string(), 500));
 
-            if let Err(err) = client.logout().await {
+            // A logout with no client (nothing to invalidate server-side)
+            // still wipes local state and returns to sign-in.
+            if let Some(client) = matrix.client_opt()
+                && let Err(err) = client.logout().await
+            {
                 App::send(ProgressComplete);
                 App::send(Error(err.to_string()));
                 return;
@@ -1028,12 +1033,23 @@ impl Matrix {
 
             let (data_dir, _) = Matrix::dirs();
 
-            App::send(ProgressComplete);
-
-            match fs::remove_dir_all(&data_dir) {
-                Ok(_) => App::send(MatuiEvent::LoggedOut),
-                Err(err) => App::send(Error(err.to_string())),
+            // A failed wipe leaves the session alive: say so and stay.
+            if let Err(err) = fs::remove_dir_all(&data_dir) {
+                App::send(ProgressComplete);
+                App::send(Error(err.to_string()));
+                return;
             }
+
+            // Stop the old session's background work now that its files
+            // are gone, and drop the client so a fresh sign-in can set a
+            // new one. No await between the wipe and this, so the loop
+            // cannot recreate anything in between.
+            matrix.bump_generation();
+            matrix.clear_client();
+            matrix.room_cache.clear();
+
+            App::send(ProgressComplete);
+            App::send(MatuiEvent::LoggedOut);
         });
     }
 

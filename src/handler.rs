@@ -105,7 +105,12 @@ pub fn handle_app_event(event: MatuiEvent, app: &mut App) {
             }
         }
         MatuiEvent::LoggedOut => {
-            app.running = false;
+            // Sign-out lands back on the sign-in form: the session is
+            // gone, so the old UI state goes with it. Quitting here used
+            // to be the only logout, which left file surgery as the only
+            // way back to sign-in.
+            reset_for_signin(app);
+            app.set_popup(Popup::Homeserver(Homeserver::default()));
         }
         MatuiEvent::LoginRequired => {
             // No valid session means no valid chat, thread, verification,
