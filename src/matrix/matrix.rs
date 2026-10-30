@@ -155,6 +155,14 @@ impl Matrix {
         (data_dir, session_file)
     }
 
+    /// Where the log file lives: next to the session, so it is always
+    /// findable. Mirrors dirs() (including the matui fallback) so the log
+    /// and the session never disagree about the home.
+    pub fn log_path() -> PathBuf {
+        let (data_dir, _) = Self::dirs();
+        data_dir.join("cyberia.log")
+    }
+
     pub(crate) fn client_opt(&self) -> Option<Client> {
         self.client.lock().expect("to lock client").clone()
     }

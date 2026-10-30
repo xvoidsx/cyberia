@@ -8,14 +8,22 @@ use cyberia::event::{Event, EventHandler};
 use cyberia::handler::{
     handle_app_event, handle_blur_event, handle_focus_event, handle_key_event, handle_paste_event,
 };
+use cyberia::matrix::matrix::Matrix;
 use cyberia::settings::watch_settings_forever;
 use std::io::stdout;
 
 fn main() -> anyhow::Result<()> {
-    if cfg!(debug_assertions) {
-        simple_logging::log_to_file("test.log", LevelFilter::Info)?;
-        log_panics::init();
+    // Logging is unconditional, not debug-only: the installed release
+    // build is the one that needs diagnosing, and a debug-only log never
+    // exists there. The path sits next to the session file so it is
+    // always findable; create the directory first, since it may not
+    // exist on a first run (log_to_file itself creates no directories).
+    let log_path = Matrix::log_path();
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    simple_logging::log_to_file(&log_path, LevelFilter::Info)?;
+    log_panics::init();
 
     watch_settings_forever();
 
