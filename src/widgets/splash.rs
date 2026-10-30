@@ -224,10 +224,16 @@ impl Splash {
     }
 
     fn draw_rain(&self, buf: &mut Buffer, area: Rect) {
+        let text_rows = Self::text_rows(area.height);
         for col in &self.cols {
             for (i, g) in col.glyphs.iter().enumerate() {
                 let y = (col.head_y - i as f32).round() as i32;
                 if y < 0 || y >= area.height as i32 {
+                    continue;
+                }
+                // never on a text row: the rain stays visible everywhere
+                // else without ever touching a letter
+                if text_rows.contains(&(y as u16)) {
                     continue;
                 }
                 let t = i as f32 / col.len.max(1) as f32;
@@ -243,6 +249,21 @@ impl Splash {
                 cell.set_style(style);
             }
         }
+    }
+
+    /// Rows that carry text (title, tagline, unread summary, footer).
+    /// Rain never lands in these rows, so it can fall all around the
+    /// text without ever interacting with a letter. The summary row is
+    /// included even outside ambient mode, where nothing is drawn there
+    /// — one less special case, and the band stays clean either way.
+    fn text_rows(height: u16) -> [u16; 4] {
+        let mid = height / 2;
+        [
+            mid.saturating_sub(1),
+            mid + 1,
+            mid + 3,
+            height.saturating_sub(2),
+        ]
     }
 
     fn draw_title(&mut self, buf: &mut Buffer, area: Rect) {
@@ -463,6 +484,49 @@ mod tests {
         assert!(mid != Color::Rgb(57, 255, 20));
     }
 
+
+    #[test]
+    fn ambient_rain_avoids_text_rows() {
+        let mut s = Splash::ambient(4, 1);
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        for _ in 0..40 {
+            s.tick_frame();
+            term.draw(|f| s.render_frame(f)).unwrap();
+        }
+        let buf = term.backend().buffer().clone();
+        let is_kana = |c: char| ('\u{30A0}'..='\u{30FF}').contains(&c);
+        // tagline (13), summary (15), footer (22): no katakana at all
+        for y in [13u16, 15, 22] {
+            for x in 0..80 {
+                let sym = buf[(x, y)].symbol();
+                assert!(
+                    !sym.chars().any(is_kana),
+                    "rain on text row {y} at x={x}: {sym}"
+                );
+            }
+        }
+        // title row (11): katakana only where the designed glitch may
+        // put it — on a title-letter cell, never between letters
+        let x0 = (80u16 - 13) / 2;
+        let title_xs: Vec<u16> = (0..7).map(|i| x0 + i * 2).collect();
+        for x in 0..80 {
+            let sym = buf[(x, 11)].symbol();
+            if sym.chars().any(is_kana) {
+                assert!(
+                    title_xs.contains(&x),
+                    "rain katakana on title row at non-title x={x}: {sym}"
+                );
+            }
+        }
+        // and the text itself survives intact
+        let row_string = |y: u16| -> String {
+            (0..80).map(|x| buf[(x, y)].symbol()).collect()
+        };
+        assert!(row_string(13).contains("enter the wired"));
+        assert!(row_string(15).contains("[[ 4 messages in 1 room ]]"));
+        assert!(row_string(22).contains("ambient"));
+    }
     #[test]
     fn ambient_stores_unread_counts() {
         let s = Splash::ambient(5, 2);
