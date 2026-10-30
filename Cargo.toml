@@ -1,6 +1,6 @@
 [package]
 name = "cyberia"
-version = "1.1.6"
+version = "1.1.8"
 authors = ["Phil Kulak"]
 edition = "2024"
 
