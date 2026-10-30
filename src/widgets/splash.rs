@@ -211,6 +211,11 @@ impl Splash {
         }
 
         let buf = frame.buffer_mut();
+        // clear first: the buffer persists across frames, and without
+        // this old rain glyphs accumulate over the text — the same
+        // smudging the room list already clears for. Ambient mode runs
+        // indefinitely, so it accumulates the longest.
+        buf.merge(&Buffer::empty(area));
         self.draw_rain(buf, area);
         self.draw_title(buf, area);
         self.draw_tagline(buf, area);

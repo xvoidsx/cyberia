@@ -83,7 +83,10 @@ impl Rooms {
     }
 
     /// Advance the hub rain. Called from render (the popup renders every tick).
-    fn tick_rain(&self, area: Rect, buf: &mut Buffer) {
+    /// Rain is kept out of `exclude` (the content block): katakana packed
+    /// between list rows reads as text interference, not atmosphere, so
+    /// the rain lives in the margins and the list stays clean.
+    fn tick_rain(&self, area: Rect, buf: &mut Buffer, exclude: Rect) {
         let mut rain = self.rain.borrow_mut();
 
         // (re)init on resize
@@ -114,13 +117,22 @@ impl Rooms {
                 if y < 0 || y >= area.height as i32 {
                     continue;
                 }
+                let y = y as u16;
+                // keep rain out of the content block (see the doc comment)
+                if col.x >= exclude.x
+                    && col.x < exclude.x.saturating_add(exclude.width)
+                    && y >= exclude.y
+                    && y < exclude.y.saturating_add(exclude.height)
+                {
+                    continue;
+                }
                 let t = i as f32 / col.len.max(1) as f32;
                 // push the ramp darker: hub rain is atmosphere, not theater
                 let color = match rain_color(t) {
                     Color::Rgb(r, g, b) => Color::Rgb(r / 4, g / 4, b / 4),
                     c => c,
                 };
-                let cell = &mut buf[(col.x, y as u16)];
+                let cell = &mut buf[(col.x, y)];
                 // don't stomp cells the content already claimed
                 if cell.symbol() == " " {
                     cell.set_char(*g);
@@ -298,18 +310,24 @@ impl Widget for RoomsWidget<'_> {
         // old rain glyphs accumulate into dark smudges over the text
         buf.merge(&Buffer::empty(area));
 
-        // rain first: atmosphere behind everything. No solid backdrop —
-        // the hub stays translucent so rain drifts behind the text.
-        self.rooms.tick_rain(area, buf);
-
-        let area = Layout::default()
+        // The content block, computed before the rain so the rain can be
+        // kept out of it (see tick_rain). The popup is fullscreen, so
+        // these area-relative coordinates are absolute buffer coordinates
+        // and the exclusion lines up with what is drawn below.
+        let block_area = Layout::default()
             .direction(Direction::Horizontal)
             .vertical_margin(1)
             .horizontal_margin(get_margin(area.width, 70))
             .constraints([Constraint::Percentage(100)].as_ref())
             .split(area)[0];
 
-        // Render the main block (transparent bg — rain shows through)
+        // rain first, but only outside the content block: atmosphere in
+        // the margins, a clean list inside.
+        self.rooms.tick_rain(area, buf, block_area);
+
+        let area = block_area;
+
+        // Render the main block (rain stays outside it, in the margins)
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
