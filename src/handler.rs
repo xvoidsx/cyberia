@@ -3,6 +3,7 @@ use crate::matrix::matrix::format_emojis;
 use crate::spawn::pasted_file_paths;
 use crate::widgets::EventResult;
 use crate::widgets::confirm::{Confirm, ConfirmBehavior};
+use crate::widgets::command::Command;
 use crate::widgets::error::Error;
 use crate::widgets::help::Help;
 use crate::widgets::homeserver::Homeserver;
@@ -339,9 +340,24 @@ pub fn handle_key_event(
         return Ok(());
     }
 
-    // any key dismisses the startup splash; the keypress itself is consumed
+    // any key dismisses the startup splash; the keypress itself is consumed,
+    // except ':' which also opens the command palette — the palette is
+    // available whenever its key is pressed, even over the splash.
     if app.splash.is_some() {
         app.splash = None;
+        if key_event.code == KeyCode::Char(':') {
+            app.set_popup(Popup::Command(Command::default()));
+        }
+        return Ok(());
+    }
+
+    // ':' over Help opens the palette instead of merely closing Help:
+    // Help's key handler would otherwise swallow it as a close, and the
+    // palette must win whenever its key is pressed.
+    if key_event.code == KeyCode::Char(':')
+        && matches!(app.popup, Some(Popup::Help(_)))
+    {
+        app.set_popup(Popup::Command(Command::default()));
         return Ok(());
     }
 
@@ -379,6 +395,17 @@ pub fn handle_key_event(
         }
         KeyCode::Char('?') => {
             app.set_popup(Popup::Help(Help::default()));
+            return Ok(());
+        }
+        // ':' opens the command palette from anywhere. This arm runs after
+        // popup first-crack, so text inputs (room search, command input
+        // itself, compose) still receive ':' as typed text, and only a
+        // state with no text input consuming it reaches here — which is
+        // exactly the gap that left Reconnecting with no way to reach
+        // :logout. (Chat's own ':' arm now never fires first, but it
+        // opens the same palette, so nothing changes there.)
+        KeyCode::Char(':') => {
+            app.set_popup(Popup::Command(Command::default()));
             return Ok(());
         }
         // The modifiers matter here: the match is on the code alone, so
