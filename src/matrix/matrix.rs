@@ -73,7 +73,8 @@ use crate::app::App;
 use crate::event::Event;
 use crate::event::Event::Matui;
 use crate::handler::MatuiEvent::{
-    Error, ProgressComplete, ProgressStarted, VerificationCompleted, VerificationStarted,
+    Error, HomeserverDegraded, ProgressComplete, ProgressStarted, VerificationCompleted,
+    VerificationStarted,
 };
 use crate::handler::{Batch, MatuiEvent, SyncType};
 use crate::matrix::roomcache::{DecoratedRoom, RoomCache};
@@ -101,6 +102,10 @@ pub struct Matrix {
     /// True while the forever sync loop is running, so a reconnect cannot
     /// start a second loop on top of it.
     sync_loop_running: Arc<AtomicBool>,
+    /// Health of the forever sync loop (consecutive failures, backoff,
+    /// whether the degraded alert is already showing). Shared with the
+    /// sync callback, which can only capture by shared reference.
+    sync_health: Arc<Mutex<SyncHealth>>,
 }
 
 /// What should we do with the file after we download it?
@@ -125,6 +130,7 @@ impl Default for Matrix {
             generation: Arc::new(AtomicU64::new(0)),
             startup_sync_in_flight: Arc::new(AtomicBool::new(false)),
             sync_loop_running: Arc::new(AtomicBool::new(false)),
+            sync_health: Arc::new(Mutex::new(SyncHealth::new())),
         }
     }
 }
@@ -172,6 +178,15 @@ impl Matrix {
     /// popup closes mid-sync instead of going blank.
     pub(crate) fn startup_sync_in_flight(&self) -> bool {
         self.startup_sync_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// True while the forever sync loop is failing repeatedly against the
+    /// homeserver. The chat header reads this for its persistent alert.
+    pub(crate) fn homeserver_degraded(&self) -> bool {
+        self.sync_health
+            .lock()
+            .map(|health| health.is_degraded())
+            .unwrap_or(false)
     }
 
     pub(crate) fn client(&self) -> Client {
@@ -542,6 +557,7 @@ impl Matrix {
         let generation_flag = self.generation.clone();
         let generation = self.generation();
         let loop_flag = self.sync_loop_running.clone();
+        let health = self.sync_health.clone();
 
         App::spawn(async move {
             let _guard = FlagGuard(loop_flag);
@@ -563,10 +579,47 @@ impl Matrix {
                     let response = match sync_result {
                         Ok(resp) => resp,
                         Err(err) => {
-                            error!("no sync result: {}", err);
+                            // A dead token will never come back: end the
+                            // loop instead of retrying forever — and
+                            // instead of raising the degraded alert, which
+                            // would blame the homeserver for an auth
+                            // failure. The loop-end error below surfaces it.
+                            if matches!(
+                                err.client_api_error_kind(),
+                                Some(matrix_sdk::ruma::api::error::ErrorKind::UnknownToken(_))
+                            ) {
+                                return Err(err);
+                            }
+
+                            // Sustained failure means the homeserver is
+                            // unreachable or degraded: count it, back off
+                            // so a sick server is not hammered, and raise
+                            // the alert once when the threshold is crossed.
+                            let (alert, delay) = {
+                                let mut health = health.lock().expect("to lock sync health");
+                                let alert = health.record_failure(&err.to_string());
+                                let delay = health.next_backoff();
+                                (alert, delay)
+                            };
+
+                            if let Some(msg) = alert {
+                                App::send(HomeserverDegraded(msg));
+                            }
+
+                            error!("no sync result: {err}");
+                            tokio::time::sleep(delay).await;
                             return Ok(LoopCtrl::Continue);
                         }
                     };
+
+                    // A good sync clears the degraded state, so the header
+                    // alert goes away on its own when the server recovers.
+                    {
+                        let mut health = health.lock().expect("to lock sync health");
+                        if health.record_success() {
+                            info!("homeserver recovered after repeated sync failures");
+                        }
+                    }
 
                     let (_, session_file) = Matrix::dirs();
 
@@ -1657,6 +1710,68 @@ async fn build_client(
     ))
 }
 
+/// Health of the forever sync loop: how many syncs have failed in a row,
+/// and how long to wait before the next attempt.
+///
+/// Pure state, no I/O, so the transitions are unit-tested: a single blip
+/// stays silent, sustained failure raises the alert once, one good sync
+/// clears it, and the backoff grows to a cap instead of hammering a sick
+/// server. Mirrors the startup sync's backoff (1s, doubling to a 30s cap).
+struct SyncHealth {
+    failures: u32,
+    backoff: Duration,
+    alerted: bool,
+}
+
+impl SyncHealth {
+    /// Failures in a row before the homeserver counts as degraded.
+    const DEGRADED_AFTER: u32 = 3;
+    /// First retry waits this long; each failure doubles it.
+    const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+    /// Backoff never grows past this.
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+    fn new() -> Self {
+        Self {
+            failures: 0,
+            backoff: Self::INITIAL_BACKOFF,
+            alerted: false,
+        }
+    }
+
+    fn is_degraded(&self) -> bool {
+        self.alerted
+    }
+
+    /// Record a failed sync. Returns the error to show the first time the
+    /// loop crosses into degraded, so the caller raises the alert once.
+    fn record_failure(&mut self, err: &str) -> Option<String> {
+        self.failures += 1;
+        if self.failures >= Self::DEGRADED_AFTER && !self.alerted {
+            self.alerted = true;
+            Some(err.to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Record a successful sync. Returns true if the loop was degraded and
+    /// has now recovered.
+    fn record_success(&mut self) -> bool {
+        self.failures = 0;
+        self.backoff = Self::INITIAL_BACKOFF;
+        std::mem::replace(&mut self.alerted, false)
+    }
+
+    /// How long to wait before the next sync attempt. Grows with each
+    /// failure, up to the cap.
+    fn next_backoff(&mut self) -> Duration {
+        let delay = self.backoff;
+        self.backoff = std::cmp::min(self.backoff * 2, Self::MAX_BACKOFF);
+        delay
+    }
+}
+
 fn build_sync_settings(sync_token: Option<String>) -> SyncSettings {
     let mut state_filter = RoomEventFilter::empty();
     state_filter.lazy_load_options = LazyLoadOptions::Enabled {
@@ -2041,4 +2156,64 @@ pub fn format_emojis(emojis: [Emoji; 7]) -> String {
         .map(|e| center_emoji(e))
         .collect::<Vec<_>>()
         .join("")
+}
+
+#[cfg(test)]
+mod sync_health_tests {
+    use super::*;
+
+    #[test]
+    fn single_blip_stays_silent() {
+        let mut health = SyncHealth::new();
+        assert!(health.record_failure("boom").is_none());
+        assert!(!health.is_degraded());
+        assert!(!health.record_success());
+    }
+
+    #[test]
+    fn three_failures_raise_the_alert_once() {
+        let mut health = SyncHealth::new();
+        assert!(health.record_failure("a").is_none());
+        assert!(health.record_failure("b").is_none());
+        let alert = health.record_failure("c");
+        assert_eq!(alert.as_deref(), Some("c"));
+        assert!(health.is_degraded());
+        // No repeat alerts while it stays degraded.
+        assert!(health.record_failure("d").is_none());
+    }
+
+    #[test]
+    fn one_good_sync_clears_it_and_a_new_episode_can_alert_again() {
+        let mut health = SyncHealth::new();
+        health.record_failure("a");
+        health.record_failure("b");
+        health.record_failure("c");
+        assert!(health.record_success());
+        assert!(!health.is_degraded());
+        assert!(!health.record_success());
+        health.record_failure("a");
+        health.record_failure("b");
+        assert!(health.record_failure("c").is_some());
+    }
+
+    #[test]
+    fn backoff_doubles_to_the_cap() {
+        let mut health = SyncHealth::new();
+        assert_eq!(health.next_backoff(), Duration::from_secs(1));
+        assert_eq!(health.next_backoff(), Duration::from_secs(2));
+        assert_eq!(health.next_backoff(), Duration::from_secs(4));
+        assert_eq!(health.next_backoff(), Duration::from_secs(8));
+        assert_eq!(health.next_backoff(), Duration::from_secs(16));
+        assert_eq!(health.next_backoff(), Duration::from_secs(30));
+        assert_eq!(health.next_backoff(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn success_resets_the_backoff() {
+        let mut health = SyncHealth::new();
+        health.next_backoff();
+        health.next_backoff();
+        health.record_success();
+        assert_eq!(health.next_backoff(), Duration::from_secs(1));
+    }
 }

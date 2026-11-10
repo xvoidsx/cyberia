@@ -31,6 +31,11 @@ use matrix_sdk::ruma::events::AnyTimelineEvent;
 pub enum MatuiEvent {
     Confirm(String, String),
     Error(String),
+    /// The forever sync loop has failed repeatedly: the homeserver is
+    /// unreachable or degraded. Carries the last error, shown once as an
+    /// alert; the chat header keeps the persistent indicator until the
+    /// next successful sync clears it.
+    HomeserverDegraded(String),
     Invited(Room, String),
     LoggedOut,
     LoginComplete,
@@ -97,6 +102,17 @@ pub fn handle_app_event(event: MatuiEvent, app: &mut App) {
         }
         MatuiEvent::Error(msg) => {
             app.set_popup(Popup::Error(Error::new(msg)));
+        }
+        MatuiEvent::HomeserverDegraded(msg) => {
+            // One alert on the transition into degraded — the header
+            // indicator is the persistent part, so this never repeats
+            // while the outage lasts.
+            app.set_popup(Popup::Error(Error::with_heading(
+                "Homeserver unreachable".to_string(),
+                format!(
+                    "{msg}\n\nShowing the last messages we have. New messages will appear when the server answers again.\n\nCtrl+R retries the connection."
+                ),
+            )));
         }
         MatuiEvent::Invited(room, msg) => {
             // only prompt once per session, no matter how many times we hear

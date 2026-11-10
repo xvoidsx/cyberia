@@ -43,7 +43,7 @@ use std::sync::Mutex;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, List, ListDirection, ListItem, ListState, Paragraph,
     StatefulWidget, Widget,
@@ -1139,12 +1139,29 @@ impl Widget for ChatWidget<'_> {
             header_text.push_str(" (muted)")
         }
 
-        // render the header
-        let header = Block::default()
-            .title(Span::styled(
+        // A degraded homeserver gets a persistent warning in the header,
+        // in the warning colour, so the user can see at a glance that the
+        // messages on screen may be stale. The room name is truncated to
+        // leave room for it; the alert clears itself on the next good sync.
+        let title = if self.chat.matrix.homeserver_degraded() {
+            let warning = "  ⚠ homeserver unreachable";
+            let budget = (splits[0].width as usize)
+                .saturating_sub(8)
+                .saturating_sub(warning.chars().count());
+            Line::from(vec![
+                Span::styled(truncate(header_text, budget), role::accent_bold()),
+                Span::styled(warning, role::warning()),
+            ])
+        } else {
+            Line::from(Span::styled(
                 truncate(header_text, (splits[0].width - 8).into()),
                 role::accent_bold(),
             ))
+        };
+
+        // render the header
+        let header = Block::default()
+            .title(title)
             .title_alignment(Alignment::Center)
             .style(Style::default().bg(Color::Reset))
             .borders(Borders::ALL)
