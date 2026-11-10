@@ -208,10 +208,29 @@ impl DecoratedRoom {
             })
         }
 
-        match inner(room.clone(), name.clone()).await {
-            Ok(r) => r,
-            Err(e) => {
+        // One slow room must not hold the whole list hostage: ten
+        // seconds per room, then the bare entry (name, no last message),
+        // the same fallback as any other fetch failure.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            inner(room.clone(), name.clone()),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 info!("could not fetch room details: {}", e);
+                DecoratedRoom {
+                    inner: room,
+                    name,
+                    visited: false,
+                    last_message: None,
+                    last_sender: None,
+                    last_ts: None,
+                }
+            }
+            Err(_) => {
+                info!("room details timed out for {}", room.room_id());
                 DecoratedRoom {
                     inner: room,
                     name,

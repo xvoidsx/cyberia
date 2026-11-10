@@ -180,13 +180,14 @@ impl Matrix {
         self.startup_sync_in_flight.load(Ordering::SeqCst)
     }
 
-    /// True while the forever sync loop is failing repeatedly against the
-    /// homeserver. The chat header reads this for its persistent alert.
-    pub(crate) fn homeserver_degraded(&self) -> bool {
+    /// The status light's reading: Unknown until anything has succeeded,
+    /// Online while syncs land, Degraded when the loop fails repeatedly
+    /// or the probe says the server is down. The chat header reads this.
+    pub(crate) fn homeserver_status(&self) -> HomeserverStatus {
         self.sync_health
             .lock()
-            .map(|health| health.is_degraded())
-            .unwrap_or(false)
+            .map(|health| health.status())
+            .unwrap_or(HomeserverStatus::Unknown)
     }
 
     pub(crate) fn client(&self) -> Client {
@@ -260,7 +261,7 @@ impl Matrix {
 
         App::send(MatuiEvent::SyncStarted(SyncType::Latest));
 
-        let (client, token) = match restore_session(session_file.as_path()).await {
+        let (client, _token) = match restore_session(session_file.as_path()).await {
             Ok(tuple) => tuple,
             Err(err) => {
                 App::send(Error(err.to_string()));
@@ -274,13 +275,16 @@ impl Matrix {
 
         self.watch_session(client.clone());
 
-        info!("syncing with stored token: {}", token.is_some());
+        // Show what the store already has before any network round-trip:
+        // the rooms and their last messages are cached locally, so the
+        // user is never stuck on a syncing screen while the first sync
+        // is still in flight. The forever loop (started by SyncComplete)
+        // keeps them fresh, and the status light says how fresh they
+        // are. A dead token surfaces there instead: the loop routes it
+        // to sign-in.
+        self.room_cache.populate(client.clone()).await;
 
-        if startup_sync(&client, token, &session_file).await {
-            self.room_cache.populate(client).await;
-
-            App::send(MatuiEvent::SyncComplete);
-        }
+        App::send(MatuiEvent::SyncComplete);
     }
 
     /// Retry the connection on demand (Ctrl+R): re-run the startup sync on
@@ -558,6 +562,12 @@ impl Matrix {
         let generation = self.generation();
         let loop_flag = self.sync_loop_running.clone();
         let health = self.sync_health.clone();
+        // Cloned here: the loop's spawn below moves `client` into its
+        // own task, and the probe needs one too.
+        let probe_client = client.clone();
+        let probe_health = self.sync_health.clone();
+        let probe_generation_flag = self.generation.clone();
+        let probe_generation = self.generation();
 
         App::spawn(async move {
             let _guard = FlagGuard(loop_flag);
@@ -638,8 +648,49 @@ impl Matrix {
             if let Err(err) = result
                 && generation_flag.load(Ordering::SeqCst) == generation
             {
-                error!("sync loop ended: {}", err);
-                App::send(Error(format!("Sync failed: {}", err)));
+                // A dead token will never come back: set the session
+                // aside and route to sign-in, the way the startup sync
+                // does, instead of stranding the user on stale rooms
+                // behind a "Sync failed" popup.
+                if matches!(
+                    err.client_api_error_kind(),
+                    Some(matrix_sdk::ruma::api::error::ErrorKind::UnknownToken(_))
+                ) {
+                    let (_, session_file) = Matrix::dirs();
+                    recover_dead_session(&session_file);
+                } else {
+                    error!("sync loop ended: {}", err);
+                    App::send(Error(format!("Sync failed: {}", err)));
+                }
+            }
+        });
+
+        // A lightweight second opinion on the homeserver's health: a
+        // versions request on a timer, so the status light has an answer
+        // even when the sync loop itself is stalled on a hanging request
+        // and has nothing to report. The probe only ever flips the light
+        // while no sync has succeeded yet — once the loop is the
+        // authority, a probe blip stays silent. Stops with the session,
+        // like the loop.
+        App::spawn(async move {
+            // Probe at once, so the light answers fast on a fresh
+            // startup, then on the timer.
+            loop {
+                if probe_generation_flag.load(Ordering::SeqCst) != probe_generation {
+                    break;
+                }
+
+                let ok = probe_client
+                    .send(
+                        matrix_sdk::ruma::api::client::discovery::get_supported_versions::Request::new(),
+                    )
+                    .await
+                    .is_ok();
+                if let Ok(mut health) = probe_health.lock() {
+                    health.record_probe(ok);
+                }
+
+                tokio::time::sleep(Duration::from_secs(45)).await;
             }
         });
     }
@@ -1710,6 +1761,21 @@ async fn build_client(
     ))
 }
 
+/// What the status light shows. Pure state, derived from the sync loop's
+/// health plus the timed probe below: the loop is the heartbeat, the probe
+/// is the second opinion for when the loop itself is stalled and has
+/// nothing to report yet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HomeserverStatus {
+    /// No sync has succeeded yet and the probe has not spoken either.
+    Unknown,
+    /// A sync succeeded and nothing is failing.
+    Online,
+    /// The loop failed repeatedly, or the probe says the server is down
+    /// before the loop has had its say.
+    Degraded,
+}
+
 /// Health of the forever sync loop: how many syncs have failed in a row,
 /// and how long to wait before the next attempt.
 ///
@@ -1721,6 +1787,8 @@ struct SyncHealth {
     failures: u32,
     backoff: Duration,
     alerted: bool,
+    succeeded_once: bool,
+    probe_ok: Option<bool>,
 }
 
 impl SyncHealth {
@@ -1736,11 +1804,24 @@ impl SyncHealth {
             failures: 0,
             backoff: Self::INITIAL_BACKOFF,
             alerted: false,
+            succeeded_once: false,
+            probe_ok: None,
         }
     }
 
-    fn is_degraded(&self) -> bool {
-        self.alerted
+    /// The status light's reading. A failed probe only counts while the
+    /// loop has never succeeded: once a sync has worked, the loop is the
+    /// authority, and a probe blip must not paint the light red.
+    fn status(&self) -> HomeserverStatus {
+        if self.alerted {
+            HomeserverStatus::Degraded
+        } else if self.succeeded_once {
+            HomeserverStatus::Online
+        } else if self.probe_ok == Some(false) {
+            HomeserverStatus::Degraded
+        } else {
+            HomeserverStatus::Unknown
+        }
     }
 
     /// Record a failed sync. Returns the error to show the first time the
@@ -1760,7 +1841,15 @@ impl SyncHealth {
     fn record_success(&mut self) -> bool {
         self.failures = 0;
         self.backoff = Self::INITIAL_BACKOFF;
+        self.succeeded_once = true;
         std::mem::replace(&mut self.alerted, false)
+    }
+
+    /// Record the timed probe's verdict: whether the homeserver answered
+    /// a versions request. Only ever flips the light while no sync has
+    /// succeeded yet (see `status`).
+    fn record_probe(&mut self, ok: bool) {
+        self.probe_ok = Some(ok);
     }
 
     /// How long to wait before the next sync attempt. Grows with each
@@ -2166,7 +2255,7 @@ mod sync_health_tests {
     fn single_blip_stays_silent() {
         let mut health = SyncHealth::new();
         assert!(health.record_failure("boom").is_none());
-        assert!(!health.is_degraded());
+        assert_eq!(health.status(), HomeserverStatus::Unknown);
         assert!(!health.record_success());
     }
 
@@ -2177,7 +2266,7 @@ mod sync_health_tests {
         assert!(health.record_failure("b").is_none());
         let alert = health.record_failure("c");
         assert_eq!(alert.as_deref(), Some("c"));
-        assert!(health.is_degraded());
+        assert_eq!(health.status(), HomeserverStatus::Degraded);
         // No repeat alerts while it stays degraded.
         assert!(health.record_failure("d").is_none());
     }
@@ -2189,7 +2278,7 @@ mod sync_health_tests {
         health.record_failure("b");
         health.record_failure("c");
         assert!(health.record_success());
-        assert!(!health.is_degraded());
+        assert_eq!(health.status(), HomeserverStatus::Online);
         assert!(!health.record_success());
         health.record_failure("a");
         health.record_failure("b");
@@ -2215,5 +2304,40 @@ mod sync_health_tests {
         health.next_backoff();
         health.record_success();
         assert_eq!(health.next_backoff(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn status_starts_unknown_then_goes_online_on_success() {
+        let mut health = SyncHealth::new();
+        assert_eq!(health.status(), HomeserverStatus::Unknown);
+        health.record_success();
+        assert_eq!(health.status(), HomeserverStatus::Online);
+    }
+
+    #[test]
+    fn a_failed_probe_counts_while_nothing_has_synced_yet() {
+        let mut health = SyncHealth::new();
+        health.record_probe(false);
+        assert_eq!(health.status(), HomeserverStatus::Degraded);
+        // ...but a probe saying "up" is not a sync: still unknown.
+        let mut health = SyncHealth::new();
+        health.record_probe(true);
+        assert_eq!(health.status(), HomeserverStatus::Unknown);
+    }
+
+    #[test]
+    fn once_a_sync_has_worked_the_loop_is_the_authority() {
+        let mut health = SyncHealth::new();
+        health.record_success();
+        // A probe blip must not paint the light red.
+        health.record_probe(false);
+        assert_eq!(health.status(), HomeserverStatus::Online);
+        // Sustained loop failure still wins over everything.
+        health.record_failure("a");
+        health.record_failure("b");
+        health.record_failure("c");
+        assert_eq!(health.status(), HomeserverStatus::Degraded);
+        health.record_success();
+        assert_eq!(health.status(), HomeserverStatus::Online);
     }
 }

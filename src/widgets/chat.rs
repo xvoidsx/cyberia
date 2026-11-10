@@ -2,7 +2,7 @@ use crate::app::{App, Popup};
 use crate::clipboard::clipboard_image;
 use crate::event::{Event, EventHandler};
 use crate::handler::Batch;
-use crate::matrix::matrix::Matrix;
+use crate::matrix::matrix::{HomeserverStatus, Matrix};
 use crate::matrix::roomcache::DecoratedRoom;
 use crate::settings::{is_muted, max_events, toggle_mute};
 use crate::spawn::{get_file_paths, spawn_editor};
@@ -1139,25 +1139,23 @@ impl Widget for ChatWidget<'_> {
             header_text.push_str(" (muted)")
         }
 
-        // A degraded homeserver gets a persistent warning in the header,
-        // in the warning colour, so the user can see at a glance that the
-        // messages on screen may be stale. The room name is truncated to
-        // leave room for it; the alert clears itself on the next good sync.
-        let title = if self.chat.matrix.homeserver_degraded() {
-            let warning = "  ⚠ homeserver unreachable";
-            let budget = (splits[0].width as usize)
-                .saturating_sub(8)
-                .saturating_sub(warning.chars().count());
-            Line::from(vec![
-                Span::styled(truncate(header_text, budget), role::accent_bold()),
-                Span::styled(warning, role::warning()),
-            ])
-        } else {
-            Line::from(Span::styled(
-                truncate(header_text, (splits[0].width - 8).into()),
-                role::accent_bold(),
-            ))
+        // The homeserver status light rides in the header, always on:
+        // a green dot while syncs land, a red warning while the server
+        // is unreachable, a dim dot while nothing has synced yet. The
+        // room name is truncated to leave room for it; the light clears
+        // itself on the next good sync.
+        let (status_text, status_style) = match self.chat.matrix.homeserver_status() {
+            HomeserverStatus::Online => ("  ● matrix online", role::success()),
+            HomeserverStatus::Degraded => ("  ⚠ homeserver unreachable", role::warning()),
+            HomeserverStatus::Unknown => ("  ● connecting…", role::dim()),
         };
+        let budget = (splits[0].width as usize)
+            .saturating_sub(8)
+            .saturating_sub(status_text.chars().count());
+        let title = Line::from(vec![
+            Span::styled(truncate(header_text, budget), role::accent_bold()),
+            Span::styled(status_text, status_style),
+        ]);
 
         // render the header
         let header = Block::default()
